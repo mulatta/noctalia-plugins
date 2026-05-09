@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore/slicestore"
 	"fiatjaf.com/nostr/khatru"
+	"github.com/coder/websocket"
 )
 
 // startTestRelay spins up an in-process khatru relay backed by an
@@ -289,6 +291,33 @@ func TestStrangerIgnored(t *testing.T) {
 	}
 }
 
+// TestSelfCopyToOtherPeerIgnored: NIP-17 sends a self-copy for every
+// outgoing DM. A daemon configured for Noa must ignore our self-copy
+// when the inner rumor is addressed to another peer.
+func TestSelfCopyToOtherPeerIgnored(t *testing.T) {
+	t.Parallel()
+	relay := startTestRelay(t)
+
+	ourSK := nostr.Generate()
+	noaPK := nostr.GetPublicKey(nostr.Generate())
+	otherPK := nostr.GetPublicKey(nostr.Generate())
+
+	h := newHarnessWithKey(t, relay, noaPK.Hex(), ourSK)
+	sender := newHarnessWithKey(t, relay, otherPK.Hex(), ourSK)
+
+	sender.send(t, Command{Cmd: CmdSend, Text: "not for noa"})
+	sender.expect(t, EvSent, 5*time.Second)
+
+	select {
+	case ev := <-h.events:
+		if ev.Kind == EvMsg {
+			t.Fatalf("self-copy to another peer leaked through: %+v", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// good — h ignored the unrelated self-copy
+	}
+}
+
 func wsAccept(key string) string {
 	h := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	return base64.StdEncoding.EncodeToString(h[:])
@@ -323,6 +352,74 @@ func startZombieRelay(t *testing.T) (url string, dials *atomic.Int32) {
 	}))
 	t.Cleanup(srv.Close)
 	return "ws" + strings.TrimPrefix(srv.URL, "http"), dials
+}
+
+// startDeadSubscriptionRelay keeps the websocket open but drops the
+// first REQ stream. Events added after that first REQ only arrive after
+// the client opens another subscription, matching the observed failure
+// mode: socket health stays green while the active stream is dead.
+func startDeadSubscriptionRelay(t *testing.T) (url string, reqs *atomic.Int32, add func(nostr.Event)) {
+	t.Helper()
+	reqs = &atomic.Int32{}
+	var mu sync.Mutex
+	var events []nostr.Event
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "")
+		for {
+			_, msg, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var frame []json.RawMessage
+			if err := json.Unmarshal(msg, &frame); err != nil || len(frame) < 2 {
+				continue
+			}
+			var typ string
+			if err := json.Unmarshal(frame[0], &typ); err != nil {
+				continue
+			}
+			switch typ {
+			case "REQ":
+				var subID string
+				if err := json.Unmarshal(frame[1], &subID); err != nil {
+					continue
+				}
+				n := reqs.Add(1)
+				if n > 1 {
+					mu.Lock()
+					snapshot := append([]nostr.Event(nil), events...)
+					mu.Unlock()
+					for _, ev := range snapshot {
+						b, _ := json.Marshal([]any{"EVENT", subID, ev})
+						_ = c.Write(r.Context(), websocket.MessageText, b)
+					}
+				}
+				b, _ := json.Marshal([]any{"EOSE", subID})
+				_ = c.Write(r.Context(), websocket.MessageText, b)
+			case "EVENT":
+				var ev nostr.Event
+				if err := json.Unmarshal(frame[1], &ev); err != nil {
+					continue
+				}
+				mu.Lock()
+				events = append(events, ev)
+				mu.Unlock()
+				b, _ := json.Marshal([]any{"OK", ev.ID.Hex(), true, ""})
+				_ = c.Write(r.Context(), websocket.MessageText, b)
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), reqs, func(ev nostr.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, ev)
+	}
 }
 
 // TestPublishWithZombieRelay: one good relay plus one zombie that
@@ -404,6 +501,61 @@ func TestZombieRelayTriggersRedial(t *testing.T) {
 			t.Fatalf("no redial after timeout, dials=%d", dials.Load())
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+}
+
+// TestLivenessForcesPeriodicResubscribe guards against relay sockets
+// staying green while an old REQ stream silently stops delivering.
+func TestLivenessForcesPeriodicResubscribe(t *testing.T) {
+	t.Parallel()
+	relay, reqs, add := startDeadSubscriptionRelay(t)
+
+	ourSK := nostr.Generate()
+	ourKeys := Keys{SK: ourSK, PK: nostr.GetPublicKey(ourSK)}
+	peerSK := nostr.Generate()
+	peerKeys := Keys{SK: peerSK, PK: nostr.GetPublicKey(peerSK)}
+
+	l := NewListener(ourKeys, []string{relay})
+	l.livenessTick = 10 * time.Millisecond
+	l.periodicResubscribeAfter = 100 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan Rumor, 1)
+	go l.Run(ctx, func() int64 { return 0 }, ch)
+
+	deadline := time.After(5 * time.Second)
+	for reqs.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("first subscription never arrived")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	peer := NewListener(peerKeys, nil)
+	out, err := peer.Prepare(ctx, ourKeys.PK.Hex(), "missed while stream dead", "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	add(out.toThem)
+
+	select {
+	case got := <-ch:
+		t.Fatalf("received before resubscribe: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	select {
+	case got := <-ch:
+		if got.Content != "missed while stream dead" || got.PubKey != peerKeys.PK.Hex() {
+			t.Fatalf("got %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("missed event was not recovered by periodic resubscribe")
+	}
+	if reqs.Load() < 2 {
+		t.Fatalf("reqs=%d, want at least 2", reqs.Load())
 	}
 }
 
